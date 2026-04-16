@@ -1,0 +1,66 @@
+Agent stack — high-level
+========================
+
+
+          ┌──────────────┐
+          │    AGENT     │     orchestrator.ht_loop · run_loop.sh · /ht-loop
+          └──────┬───────┘
+                 │ tick: submit / poll / advance / triage
+                 ▼
+   ╔══════════════════════════════════════════════════╗
+   ║              HT SCREENING                        ║   alchemi_ht.sif
+   ║                                                  ║
+   ║    RDKit  ──▶  AIMNet2  ──▶  GPU4PySCF           ║
+   ║     3D           relax        DFT                ║
+   ║   (ETKDG)     (LBFGS/ASE)   (B3LYP/def2-svp)     ║
+   ║                                                  ║
+   ║    out:  energy, HOMO, LUMO, gap  (per SMILES)   ║
+   ╚════════════════════════╤═════════════════════════╝
+                            │
+                            │  result_*.csv stream
+                            │  (append-only)
+                            ▼
+   ╔══════════════════════════════════════════════════╗
+   ║            ACTIVE LEARNING                       ║   alchemi_clip.sif
+   ║                                                  ║
+   ║    Encoder  ──▶  Surrogate  ──▶  Search          ║
+   ║   one of 3:     RandomForest      UCB            ║
+   ║    foundation    (sklearn)       (μ + κ·σ)       ║
+   ║    gnn                                           ║
+   ║    contrastive                                   ║
+   ║                                                  ║
+   ║    out:  top-k candidate SMILES                  ║
+   ╚════════════════════════╤═════════════════════════╝
+                            │
+                            │  verify top-k via HT pipeline
+                            ▼
+                   ┌────────────────────┐
+                   │    VERIFICATION    │   (reuses HT screening)
+                   │    SLURM array     │
+                   └─────────┬──────────┘
+                             │
+                             │  verify_result_*.csv
+                             │  merged back into stream
+                             └──────────────────────┐
+                                                    │
+                                            feedback loop
+                                                    │
+                             ┌──────────────────────┘
+                             │
+                             ▼
+                      HT results stream
+                      (next AL iter's snapshot
+                       includes verified labels)
+
+
+Legend
+------
+  →    data flow
+  ╔═╗  runs inside a Singularity container
+  [  ] orchestrated stage (one or more SLURM jobs)
+
+Who does what
+-------------
+  Agent    decides WHEN        (submit, retry, trigger, triage)
+  HT       computes GROUND TRUTH   (expensive, per molecule)
+  AL       decides WHICH MOLECULES to verify next (cheap, at scale)

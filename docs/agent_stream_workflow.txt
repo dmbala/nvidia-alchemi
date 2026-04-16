@@ -1,0 +1,198 @@
+How the agent runs the HT screen and streams results to active learning
+=======================================================================
+
+The agent has two concurrent responsibilities that share ONE directory
+(runs/screen/results/) as a producer-consumer buffer:
+
+  HT SCREEN  (producer)          ─▶  runs/screen/results/  ─▶  ACTIVE LEARNING  (consumer)
+  continuous, never idles             append-only stream        fires when N new results land
+
+
+Section 1 — Timeline, zoomed out
+--------------------------------
+
+  time ─▶
+           every INTERVAL, run_loop.sh fires `claude -p` once.
+           each agent invocation advances both sides by at most one step.
+
+     tick:     t1     t2     t3     t4     t5     t6     t7     t8     t9     t10    t11   ...
+               │      │      │      │      │      │      │      │      │      │      │
+               ▼      ▼      ▼      ▼      ▼      ▼      ▼      ▼      ▼      ▼      ▼
+     agent   ┌────┐┌────┐┌────┐┌────┐┌────┐┌────┐┌────┐┌────┐┌────┐┌────┐┌────┐
+     tick    │    ││    ││    ││    ││    ││    ││    ││    ││    ││    ││    │
+             └────┘└────┘└────┘└────┘└────┘└────┘└────┘└────┘└────┘└────┘└────┘
+       HT    submit poll poll  poll  (done)-----------------------> (poll idle)
+       side  array        retry
+             0-9          OOM
+                          chunk 3
+                          w/2×mem
+
+       data    ∅    3     7     9    10    10    10    10    10    10    11  ← +1 merged verify
+       dir
+       (cum)
+
+        AL   idle idle  idle  trig! snap  train train  train  search verify merge→idle
+       side                          build contrast. surr.                        iter 2
+                                     local (SLURM)   (SLURM) (SLURM) (SLURM)      snapshot
+                                                                                  includes the
+                                                                                  new verify
+
+
+Section 2 — What the agent does on the HT screen side
+-----------------------------------------------------
+
+  One tick (HT portion):
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  python -m orchestrator.ht_loop --action tick                           │
+  │    (called by agent via Bash tool)                                      │
+  │                                                                         │
+  │  IF no SLURM job yet:                                                   │
+  │    • sbatch --array=0-N run_screening.slurm                             │
+  │    • record job_id in screen_state.json                                 │
+  │                                                                         │
+  │  ELSE for every chunk:                                                  │
+  │    • sacct state + filesystem check                                     │
+  │    • if result CSV present  → mark done                                 │
+  │    • if sacct COMPLETED but no CSV → mark anomaly (pipeline bug)        │
+  │    • if OOM   → queue retry with 2× mem (up to 3 attempts)              │
+  │    • if time  → queue retry with 2× walltime                            │
+  │    • if perma → mark failed_permanent (stream continues without it)     │
+  │                                                                         │
+  │  emit retries as new --array=<chunk_ids> submission with offset         │
+  │    (windowed if chunk_id ≥ MaxArraySize=10000)                          │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  The agent layer on top reads the pending_decisions emitted here and
+  writes a natural-language summary ("chunk 3 recovered after OOM retry",
+  "chunk 7 is an anomaly — logs show RDKit parse error on malformed SMILES").
+
+  Screen results accumulate append-only:
+
+      runs/screen/results/
+        result_0000.csv   ┐
+        result_0001.csv   │  each chunk completion adds one file
+        result_0002.csv   │  files are NEVER deleted by the orchestrator
+        result_0003.csv   │  (only merged-back verify adds more via symlink)
+        result_0004.csv   │
+        ...               ▼
+        result_verify_XX.csv  ← symlinked from runs/al/iter_N/verify_results/
+
+
+Section 3 — How the stream flows into active learning
+-----------------------------------------------------
+
+  Each tick, the AL side checks:
+
+     count(runs/screen/results/*.csv) − last_snapshot_size  ≥  trigger_threshold?
+
+  YES → start a new AL iteration. NO → stay idle, wait for more results.
+
+  The CRUCIAL DETAIL is the snapshot: when an iter fires, the agent
+  materializes a read-only view of the stream at that exact moment so
+  training is reproducible even as the stream keeps growing.
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                                                                         │
+  │   runs/screen/results/                    runs/al/iter_NNN/             │
+  │      result_0000.csv ◀────┐                 screen_snapshot/            │
+  │      result_0001.csv ◀────┼── symlinks ──▶   result_0000.csv ─▶ (link)  │
+  │      result_0002.csv ◀────┤                   result_0001.csv ─▶ (link)  │
+  │      result_0003.csv ◀────┤                   result_0002.csv ─▶ (link)  │
+  │      result_0004.csv ◀────┘                   ...                       │
+  │      result_0005.csv         ← newer results appear later;              │
+  │      result_0006.csv           they're NOT in this iter's snapshot      │
+  │      ...                       (they'll be in iter N+1's)               │
+  │                                                                         │
+  │                                              snapshot.txt   (manifest)  │
+  │                                                                         │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  Training sees a stable directory; screen keeps growing behind the scenes.
+
+
+Section 4 — AL iteration expanded (one phase per tick)
+------------------------------------------------------
+
+  trigger fires
+       │
+       ▼
+   ┌───────────────────┐  tick: local, instant
+   │ snapshot_building │    create runs/al/iter_NNN/screen_snapshot/
+   │                   │    write snapshot.txt
+   └────────┬──────────┘
+            │
+            ▼
+   ┌───────────────────┐  tick: sbatch run_train_contrastive.slrm
+   │ training          │    --results-dir = screen_snapshot/
+   │ contrastive       │    (subsequent ticks just poll sacct)
+   │     (SLURM ~4h)   │    on COMPLETED → produces contrastive_*.pt
+   └────────┬──────────┘
+            │
+            ▼
+   ┌───────────────────┐  tick: sbatch run_train_surrogate.slrm
+   │ training          │    reads encoder + snapshot
+   │ surrogate         │    on COMPLETED → produces surrogate.pkl
+   │     (SLURM ~2h)   │
+   └────────┬──────────┘
+            │
+            ▼
+   ┌───────────────────┐  tick: sbatch run_active_search.slrm
+   │ active_search     │    reads surrogate + gdb17_subset.csv
+   │     (SLURM ~2h)   │    on COMPLETED → produces
+   │                   │      active_learning_batch.csv (top-k candidates)
+   └────────┬──────────┘
+            │
+            ▼
+   ┌───────────────────┐  tick: local, runs prepare_verification.py
+   │ preparing         │    chunks batch into verify_0000.csv ... verify_NNNN.csv
+   │ verification      │
+   └────────┬──────────┘
+            │
+            ▼
+   ┌───────────────────┐  tick: sbatch --array=0-N run_verification.slrm
+   │ verification      │    reuses alchemi_ht.sif + pipeline.py (DFT!)
+   │     (SLURM array) │    on all-done → produces verify_result_*.csv
+   └────────┬──────────┘
+            │
+            ▼
+   ┌───────────────────┐  tick: local, runs merge_verify.py
+   │ merging           │    symlinks verify_result_*.csv into
+   │                   │    runs/screen/results/ as result_verify_*.csv
+   └────────┬──────────┘      ◀──── NOW visible to iter N+1's snapshot
+            │
+            ▼
+   ┌───────────────────┐
+   │ idle (iter++)     │    ready for the next trigger firing
+   └───────────────────┘
+
+
+Section 5 — The key insight
+---------------------------
+
+  Screen and AL share ONE stream directory but decouple in time:
+
+      ┌──────────────────────────────────────────────────────────┐
+      │  SCREEN writes continuously (append-only)                │
+      │      ▲                                                   │
+      │      │ +result_NNNN.csv per chunk                        │
+      │                                                          │
+      │      runs/screen/results/                                │
+      │                                                          │
+      │      │  +result_verify_NNNN.csv per merged verify        │
+      │      ▼                                                   │
+      │  AL snapshots periodically (read-only views)             │
+      │      symlinks only, so no copies, no drift,              │
+      │      reproducible training sets                          │
+      └──────────────────────────────────────────────────────────┘
+
+  The agent's tick is the ONE place both sides converge:
+     1. advance screen (submit/poll/retry)
+     2. check AL trigger
+     3. if an AL iter is active, advance its current phase
+     4. summarize in ≤4 lines of text
+
+  Screen never pauses for AL. AL iter N+1 naturally gets more data
+  than iter N because the stream grew. Verified candidates loop back
+  as training data for future iters — the feedback loop that makes
+  the active-learning part of "active learning".

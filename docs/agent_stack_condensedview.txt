@@ -1,0 +1,83 @@
+     ┌──────────────────────────────┐                                       
+                       │          AGENT               │                                       
+                       │  /ht-loop · run_loop.sh ·    │                                       
+                       │  orchestrator.ht_loop        │                                       
+                       └──────────────┬───────────────┘                                       
+                                      │ submit / poll / triage                                
+                                      ▼                                                       
+     ╔══════════════════════════════════════════════════════════════════════╗
+     ║                        HT SCREENING                                  ║                 
+     ║                       (alchemi_ht.sif)                               ║
+     ║                                                                      ║                 
+     ║   SMILES ──▶ 3D coords ──▶ relaxed geom ──▶ DFT ──▶ gap/energy       ║
+     ║                                                                      ║                 
+     ║  ┌─────────┐    ┌──────────────┐    ┌─────────────────────┐         ║
+     ║  │ RDKit   │──▶ │ AIMNet2      │──▶ │ GPU4PySCF + PySCF   │         ║                  
+     ║  │ ETKDGv3 │    │ ALCHEMI ops  │    │ B3LYP / def2-svp     │         ║                 
+     ║  │ MMFF    │    │ LBFGS (ASE)  │    │ RKS SCF on GPU       │         ║                 
+     ║  └─────────┘    └──────────────┘    └─────────────────────┘         ║                  
+     ║                                                                      ║                 
+     ║   SLURM array, per-chunk retry (OOM 2× mem, timeout 2× time)        ║                  
+     ║   output: runs/screen/results/result_NNNN.csv  (append-only stream) ║                  
+     ╚══════════════════════════════════════════════════════════════════════╝                 
+                                      │                                                       
+                             trigger: N new results                                           
+                                      │                                                       
+                                      ▼
+     ╔══════════════════════════════════════════════════════════════════════╗                 
+     ║                      ACTIVE LEARNING                                 ║                 
+     ║                     (alchemi_clip.sif)                               ║
+     ║                                                                      ║                 
+     ║   snapshot ──▶ encode ──▶ surrogate ──▶ search ──▶ verify ──▶ loop   ║
+     ║                                                                      ║                 
+     ║  ┌──────────────────┐   ┌────────────────┐   ┌────────────────────┐ ║
+     ║  │ Contrastive       │   │ Surrogate      │   │ Active Search     │ ║                  
+     ║  │ (MolecularCLIP)   │──▶│ Brain          │──▶│                    │ ║                 
+     ║  │                   │   │                │   │ • UCB acquisition │ ║                  
+     ║  │ ChemBERTa 1D + ──▶│   │ RandomForest   │   │   (μ + κ·σ)        │ ║                 
+     ║  │ SchNet 3D via     │   │ / XGBoost      │   │ • top-k candidates│ ║                  
+     ║  │ InfoNCE loss      │   │ 5-fold CV      │   │   from unexplored │ ║                  
+     ║  │                   │   │ → Spearman,    │   │   library          │ ║                 
+     ║  │ → contrastive_1d_ │   │   top-k recall │   │                    │ ║                 
+     ║  │   encoder.pt      │   │                │   │ → active_learning_│ ║                  
+     ║  │                   │   │ → surrogate.pkl│   │   batch.csv        │ ║                 
+     ║  └──────────────────┘   └────────────────┘   └──────────┬─────────┘ ║                  
+     ║                                                          │          ║                  
+     ║                                                          ▼          ║                  
+     ║                                   ┌───────────────────────────┐    ║                   
+     ║                                   │ Verification              │    ║                   
+     ║                                   │ top-k re-run through HT   │    ║
+     ║                                   │ pipeline for ground truth │    ║                   
+     ║                                   │ (SLURM array)             │    ║
+     ║                                   └────────────┬──────────────┘    ║                   
+     ╚═══════════════════════════════════════════════╪═════════════════════╝
+                                                     │                                        
+                               merge_verify.py (symlink) back into
+                                    runs/screen/results/                                      
+                                                     │   
+                                                     ▼                                        
+                                 next AL iter sees more data +                                
+                                better-labeled (surrogate-selected)                           
+                                      training examples                                       
+                                                                                              
+  Container stack (each extends the previous):                                                
+                                                         
+  alchemi.sif          → base (PyTorch + CUDA + ALCHEMI toolkit + warp)                       
+      ↓ extends                                                                               
+  alchemi_ht.sif       → + AIMNet2, RDKit, GPU4PySCF, PySCF, ASE, dftd3 shim
+      ↓ extends                                                                               
+  alchemi_clip.sif     → + transformers (ChemBERTa), xgboost, SchNet (pure PyTorch)
+                                                                                    
+
+                                                                                              
+  Separation of concerns:                                
+  - Agent decides when (submit, retry, trigger, stop).                                        
+  - HT computes ground truth (expensive, automatic per molecule).                             
+  - AL decides which molecules are worth the expensive HT evaluation next (cheap prediction +
+  UCB ranking).                                                                               
+                                                                                              
+  The agent connects the two by ticking the state machines and triaging anomalies — it never  
+  touches the DFT parameters or the ML hyperparameters, which are policy frozen in the SLURM  
+  scripts.                                               
+                          
+

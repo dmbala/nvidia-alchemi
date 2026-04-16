@@ -1,0 +1,150 @@
+How the Claude agent orchestrates the workflow (DRIVER=agent)
+=============================================================
+
+Top-level sequence
+------------------
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  run_loop.sh  (bash, inside tmux pane 0)                                │
+  │                                                                         │
+  │  while true; do                                                         │
+  │    ┌───────────────────────────────────────────────┐                    │
+  │    │  claude -p --model sonnet --max-turns 8       │  ← fires one       │
+  │    │          --permission-mode auto <prompt>      │    agent per tick  │
+  │    └────────────────────┬──────────────────────────┘                    │
+  │                         │                                               │
+  │                         ▼                                               │
+  │                  (agent block below)                                    │
+  │                         │                                               │
+  │                         ▼                                               │
+  │    ← stdout summary tee'd to runs/prod/logs/loop_<ts>_agent.log         │
+  │    sleep 900                                                            │
+  │  done                                                                   │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+
+Inside a single agent invocation
+--------------------------------
+
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │                        CLAUDE AGENT  (ephemeral)                      │
+  │                                                                       │
+  │  reads the prompt:                                                    │
+  │    "you are the autonomous /ht-loop driver. run tick. triage          │
+  │     pending_decisions by kind. report ≤4 lines. don't edit state."    │
+  │                                                                       │
+  │  ┌─────────────────────────────────────────────────────────────┐      │
+  │  │  step 1  RUN TICK  (Bash tool)                              │      │
+  │  │                                                             │      │
+  │  │    python -m orchestrator.ht_loop --mode research           │      │
+  │  │           --action tick --state ... --al-state ...          │      │
+  │  │                                                             │      │
+  │  │    python code does:                                        │      │
+  │  │      • submit array if no jobs yet                          │      │
+  │  │      • sacct + fs poll for each chunk                       │      │
+  │  │      • classify failures, bump retry resources              │      │
+  │  │      • advance AL phase if an iter is active                │      │
+  │  │      • append to pending_decisions on anomaly               │      │
+  │  │                                                             │      │
+  │  │    ← returns a short text summary to the agent              │      │
+  │  └─────────────────────────────────────────────────────────────┘      │
+  │                             │                                         │
+  │                             ▼                                         │
+  │  ┌─────────────────────────────────────────────────────────────┐      │
+  │  │  step 2  READ STATE  (Read tool)                            │      │
+  │  │                                                             │      │
+  │  │    runs/prod/screen_state.json                              │      │
+  │  │    runs/prod/al_state.json                                  │      │
+  │  │                                                             │      │
+  │  │    also reads previous tick's tail from the log file to     │      │
+  │  │    compute "what changed since last tick"                   │      │
+  │  └─────────────────────────────────────────────────────────────┘      │
+  │                             │                                         │
+  │                             ▼                                         │
+  │  ┌─────────────────────────────────────────────────────────────┐      │
+  │  │  step 3  TRIAGE  (pure reasoning + targeted Read calls)     │      │
+  │  │                                                             │      │
+  │  │    pending_decisions.kind == "anomalies"                    │      │
+  │  │        └─▶ Read: logs/screen_<job>_<task>.err               │      │
+  │  │            └─▶ summarize root cause (RDKit parse? OOM?      │      │
+  │  │                code bug?)                                   │      │
+  │  │                                                             │      │
+  │  │    pending_decisions.kind == "permanent_failures"           │      │
+  │  │        └─▶ note chunk IDs, no action (already skipped       │      │
+  │  │            by orchestrator's 3-retry cap)                   │      │
+  │  │                                                             │      │
+  │  │    pending_decisions.kind == "al_phase_failed"              │      │
+  │  │        └─▶ Read: logs/<phase>_<job>.err                     │      │
+  │  │            └─▶ classify (OOM / timeout / code bug)          │      │
+  │  │                flag for human                               │      │
+  │  │                                                             │      │
+  │  │    Bash: squeue -u $USER --array  (read-only status only)   │      │
+  │  └─────────────────────────────────────────────────────────────┘      │
+  │                             │                                         │
+  │                             ▼                                         │
+  │  ┌─────────────────────────────────────────────────────────────┐      │
+  │  │  step 4  EMIT SUMMARY                                       │      │
+  │  │                                                             │      │
+  │  │  stdout (captured by tmux/tee → log file):                  │      │
+  │  │                                                             │      │
+  │  │    tick 14:32 — screen 7/10 done (2 running, 1 OOM retry).  │      │
+  │  │    AL iter 1 in training_surrogate (job 6120168, +12m).     │      │
+  │  │    1 anomaly on chunk 4: screen_6110522_4.err shows         │      │
+  │  │    "RDKit parse error on malformed SMILES" — no action.     │      │
+  │  │                                                             │      │
+  │  │  → agent exits, bash loop resumes                           │      │
+  │  └─────────────────────────────────────────────────────────────┘      │
+  │                                                                       │
+  └───────────────────────────────────────────────────────────────────────┘
+
+
+Constraints (enforced by prompt + CLI flags)
+--------------------------------------------
+
+  The agent CAN:                        The agent CANNOT:
+    ✓ run the tick command                ✗ edit state JSON files
+    ✓ read state files                    ✗ scancel running jobs
+    ✓ read SLURM log files                ✗ modify source code
+    ✓ call squeue / sacct (read-only)     ✗ submit arbitrary sbatch
+    ✓ tail its own log                    ✗ delete result CSVs
+    ✓ produce a text summary              ✗ retry AL phases itself
+
+  Hard bounds:
+    --max-turns 8          cap tool invocations per tick
+    --permission-mode auto route low-risk tools through, prompt on the rest
+    ephemeral session      no memory across ticks (must re-read state each call)
+
+
+Accumulating visibility over time
+---------------------------------
+
+  tick 1:  "screen 0/10 done, all queued. AL idle (< trigger)."
+  tick 2:  "screen 3/10 done, 7 running. AL trigger fires — iter 1 snapshot built."
+  tick 3:  "screen 7/10 done, AL iter 1 in training_contrastive (new SLURM job)."
+  tick 4:  "screen 10/10 done! AL iter 1 in training_surrogate."
+  tick 5:  "AL iter 1 in active_search."
+  tick 6:  "AL iter 1 verify array submitted (10 chunks)."
+  tick 7:  "AL iter 1 merged 9 verify results into screen stream. idle."
+  tick 8:  "no change. considering stopping loop — all done?"
+                             ▲
+                             └── bash loop termination check kicks in
+
+
+Why use DRIVER=agent at all
+---------------------------
+
+  bash driver:   pure python output — good for grep, bad for "what's actually happening"
+  agent driver:  narrative summary — good for skimming log tail and catching anomalies
+                 without parsing JSON, especially when SLURM returns COMPLETED but
+                 nothing worked (those cases are the whole point of the triage step).
+
+
+Files referenced
+----------------
+
+  orchestrator/run_loop.sh      the tmux + bash wrapper
+  orchestrator/ht_loop.py       the tick command itself
+  runs/prod/screen_state.json   producer state
+  runs/prod/al_state.json       consumer state
+  runs/prod/logs/               tick-by-tick output log
+  logs/screen_<job>_<task>.err  per-array-task SLURM err (for triage)

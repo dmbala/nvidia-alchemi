@@ -1,0 +1,207 @@
+ALCHEMI workflow orchestration
+==============================
+
+1. COMPONENT MAP — who invokes what
+------------------------------------
+
+  Entry points                         Orchestrator driver                 Downstream
+  ┌─────────────────────────┐          ┌────────────────────────────┐
+  │ /ht-loop                │          │                            │
+  │ (Claude Code slash cmd) ├────────▶ │  python -m                 │
+  └─────────────────────────┘          │  orchestrator.ht_loop      │
+  ┌─────────────────────────┐          │                            │
+  │ run_loop.sh start       │          │  --mode {screen | research}│
+  │ (tmux, DRIVER=bash)     ├────────▶ │  --action {init | tick |   │
+  └─────────────────────────┘          │           status | ...}    │
+  ┌─────────────────────────┐          │                            │
+  │ run_loop.sh start       │          │                            │
+  │ DRIVER=agent            ├─▶claude─▶│                            │
+  │ (tmux, headless Claude) │   -p     │                            │
+  └─────────────────────────┘          └───────┬────────────────────┘
+                                               │
+                                               │ dispatches by --mode
+                            ┌──────────────────┴──────────────────┐
+                            ▼                                     ▼
+             ┌──────────────────────────┐         ┌────────────────────────────┐
+             │ screen_monitor.py        │         │ al_monitor.py              │
+             │  submit / poll / retry   │         │  phase machine             │
+             │  failure classification  │         │  (snapshot → train →       │
+             │  MaxArraySize windowing  │         │   search → verify → merge) │
+             └─────────┬────────────────┘         └──────────────┬─────────────┘
+                       │ sbatch + sacct                          │ sbatch + sacct
+                       ▼                                         ▼
+             ┌──────────────────────────┐         ┌────────────────────────────┐
+             │ HT SLURM array           │         │ AL SLURM jobs              │
+             │  run_screening.slurm     │         │  run_train_contrastive     │
+             │  (alchemi_ht.sif)        │         │  run_train_surrogate       │
+             │                          │         │  run_active_search         │
+             │                          │         │  run_verification (array)  │
+             └─────────┬────────────────┘         └──────────────┬─────────────┘
+                       │                                         │
+                       ▼                                         ▼
+             ┌──────────────────────────┐         ┌────────────────────────────┐
+             │ runs/screen/             │         │ runs/al/iter_NNN/          │
+             │   chunks/                │         │   screen_snapshot/         │
+             │   results/               │         │   models/                  │
+             │   screen_state.json      │         │   active_learning_batch.csv│
+             │                          │         │   verify_chunks/           │
+             │                          │         │   verify_results/          │
+             │                          │         │ runs/al/al_state.json      │
+             └──────────────────────────┘         └────────────────────────────┘
+
+
+2. RESEARCH-MODE STATE MACHINE — one tick advances at most one phase
+--------------------------------------------------------------------
+
+                   ┌──────────────────────────┐
+                   │       idle               │ ◀────────────────┐
+                   │  (no AL iter active)     │                  │
+                   └────────────┬─────────────┘                  │
+                                │                                │
+                                │ trigger_ready:                 │
+                                │   available ≥ min_results      │
+                                │   new_since_last ≥ threshold   │
+                                ▼                                │
+                   ┌──────────────────────────┐                  │
+                   │  snapshot_building       │  (local, ms)     │
+                   │  materialize symlinks +  │                  │
+                   │  write snapshot.txt      │                  │
+                   └────────────┬─────────────┘                  │
+                                │                                │
+                                ▼                                │
+                   ┌──────────────────────────┐                  │
+                   │  training_contrastive    │  (SLURM, ~4h)    │
+                   └────────────┬─────────────┘                  │
+                                ▼                                │
+                   ┌──────────────────────────┐                  │
+                   │  training_surrogate      │  (SLURM, ~2h)    │
+                   └────────────┬─────────────┘                  │
+                                ▼                                │
+                   ┌──────────────────────────┐                  │
+                   │  active_search           │  (SLURM, ~2h)    │
+                   └────────────┬─────────────┘                  │
+                                ▼                                │
+                   ┌──────────────────────────┐                  │
+                   │  preparing_verification  │  (local)         │
+                   │  chunk top-k into        │                  │
+                   │  verify_NNNN.csv         │                  │
+                   └────────────┬─────────────┘                  │
+                                ▼                                │
+                   ┌──────────────────────────┐                  │
+                   │  verification            │  (SLURM array,   │
+                   │  DFT via HT pipeline     │   ~1h per chunk) │
+                   └────────────┬─────────────┘                  │
+                                ▼                                │
+                   ┌──────────────────────────┐                  │
+                   │  merging                 │  (local)         │
+                   │  symlink verify_result_* │                  │
+                   │  into screen stream      │                  │
+                   └────────────┬─────────────┘                  │
+                                │                                │
+                                └───── iter++ ───────────────────┘
+
+  Failures branch to a `failed` pseudo-phase and add an entry to
+  pending_decisions (the driver never auto-retries AL phases — human triage).
+
+
+3. DATA FLOW — producer (screen) + consumer (AL) sharing one stream
+-------------------------------------------------------------------
+
+   gdb17_subset.csv
+        │
+        │ convert_smi_to_csv.py --shuffle-seed 42
+        │ chunk_data.py --chunk-size 5000 --output-dir runs/screen/chunks
+        ▼
+   runs/screen/chunks/chunk_0000.csv ... chunk_NNNN.csv
+        │
+        │ SLURM array (orchestrator submits / polls / retries)
+        │ windowed automatically if N > MaxArraySize (10000)
+        ▼
+   runs/screen/results/                       ◀── stream grows monotonically
+     result_0000.csv
+     result_0001.csv                          ◀── AL snapshots into symlinks
+     ...
+     result_verify_0042.csv     ◀─┐           ◀── merged back from AL verifies
+                                  │
+                        ┌─────────┴──────────────────────┐
+                        │  merge_verify.py               │
+                        │  (symlink, idempotent)         │
+                        └─────────┬──────────────────────┘
+                                  │
+                                  │          every N new results
+                                  │          fires an AL iter:
+                                  ▼
+             ┌────────────────────────────────────┐
+             │ runs/al/iter_NNN/                  │
+             │   screen_snapshot/                 │
+             │     result_0000.csv ─▶ symlink     │
+             │     result_0001.csv ─▶ symlink     │
+             │     ...                            │
+             │   snapshot.txt  (reproducibility)  │
+             │                                    │
+             │   train contrastive encoder        │
+             │     → models/contrastive_*.pt      │
+             │   train surrogate                  │
+             │     → models/surrogate_*.pkl       │
+             │   active search over               │
+             │     gdb17_subset.csv               │
+             │     → active_learning_batch.csv    │
+             │   prepare_verification             │
+             │     → verify_NNNN.csv              │
+             │   SLURM array (HT pipeline)        │
+             │     → verify_results/              │
+             │         verify_result_NNNN.csv     │
+             └─────────────┬──────────────────────┘
+                           │ merge_verify.py
+                           └───────────────────────▶ back into runs/screen/results/
+
+
+4. CONCURRENCY — what's running at once
+----------------------------------------
+
+  time ──▶
+         ┌───────────────── HT screen array  (many array tasks in flight) ────────────────▶
+         │        ┌───── iter 1 snapshot ──── train ── search ── verify ── merge ────▶
+         │        │         ┌───── iter 2 snapshot ──── train ── search ── verify ──▶
+         │        │         │
+  screen ├─ fires ┘         │
+  iter 1 ├──── fires once   ┘
+  iter 2 ├──────── fires after N more screen results accumulate
+  iter 3 ├──────────────── ...
+
+  Screen keeps running throughout. AL iterations overlap with each other
+  only if the orchestrator is configured to allow concurrent iters (not
+  the default — single-iter-at-a-time avoids contention on models/ dirs
+  and keeps reasoning tractable).
+
+
+5. DRIVER CHOICES — how the tick is fired
+-----------------------------------------
+
+                  every INTERVAL seconds  (default 900 = 15 min)
+                  ──────────────────────────────────────────────
+  bash driver:    python -m orchestrator.ht_loop --action tick
+                   │
+                   └─▶  state advances silently,
+                        pending_decisions accumulate in JSON files.
+
+  agent driver:   claude -p "<prompt telling agent to run tick + triage>"
+                   │
+                   └─▶  agent runs tick, inspects state files,
+                        classifies pending_decisions,
+                        summarizes in ≤4 lines of natural language.
+
+  /ht-loop skill: runs inside an active Claude Code REPL (user's session)
+                   │
+                   └─▶  same as agent driver, but inline with the
+                        user's conversation instead of headless.
+
+
+Files:
+  orchestrator/ht_loop.py         — driver
+  orchestrator/screen_monitor.py  — producer (HT screen)
+  orchestrator/al_monitor.py      — consumer (AL state machine)
+  orchestrator/snapshot.py        — snapshot builder
+  orchestrator/merge_verify.py    — verify results ↔ screen stream
+  orchestrator/run_loop.sh        — tmux-based loop wrapper
+  .claude/commands/ht-loop.md     — slash command spec
