@@ -1,0 +1,42 @@
+Bootstrap: localimage
+From: /n/netscratch/kempner_dev/Lab/bdesinghu/Agent/alchemi/container/alchemi.sif
+
+%post
+    # The base image already has PyTorch, CUDA, ALCHEMI toolkit & ops installed.
+    # Install the additional packages needed for the HT screening pipeline.
+
+    # AIMNet2 for neural-network potential relaxation
+    pip install aimnet
+
+    # Compatibility shim: aimnet imports nvalchemiops.interactions.dispersion.dftd3,
+    # which in nvalchemi-toolkit-ops 0.3.x moved to the `.torch.` subpackage.
+    # The low-level warp kernels at `._dftd3` have a different signature and must
+    # NOT be re-exported here (they don't accept cell= and other kwargs AIMNet passes).
+    DISP_DIR=$(python -c "import nvalchemiops.interactions.dispersion as d; import os; print(os.path.dirname(d.__file__))")
+    echo "from nvalchemiops.torch.interactions.dispersion import dftd3" > "${DISP_DIR}/dftd3.py"
+
+    # ASE (Atomic Simulation Environment) and RDKit for 3D embedding
+    pip install ase rdkit pandas
+
+    # GPU-accelerated PySCF for HOMO-LUMO gap calculations
+    # The PyPI package is named gpu4pyscf-cuda12x (not gpu4pyscf)
+    pip install gpu4pyscf-cuda12x pyscf
+
+    # Pre-seed the AIMNet2 asset cache so runtime containers (which are read-only)
+    # don't have to download models and don't hit the hardcoded
+    # /usr/local/lib/.../assets/ create. Matches the model used by pipeline.py.
+    ASSETS_DIR=$(python -c "import os, aimnet.calculators as c; print(os.path.join(os.path.dirname(c.__file__), 'assets'))")
+    mkdir -p "${ASSETS_DIR}"
+    curl -sSL --fail -o "${ASSETS_DIR}/aimnet2_wb97m_d3_0.pt" \
+        https://storage.googleapis.com/aimnetcentral/aimnet2v2/AIMNet2/aimnet2_wb97m_d3_0.pt
+
+%environment
+    export LC_ALL=C
+    export CUDA_CACHE_DISABLE=0
+    export PYTHONNOUSERSITE=1
+    export WARP_CACHE_PATH=/tmp/warp_cache
+
+%help
+    Container for ALCHEMI HT Screening Pipeline.
+    Includes: ALCHEMI Toolkit + AIMNet2 Relaxation + GPU4PySCF Electronic Properties.
+    Built on top of the base alchemi.sif image.

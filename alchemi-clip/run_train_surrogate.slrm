@@ -1,0 +1,60 @@
+#!/bin/bash
+#SBATCH --job-name=train-brain
+#SBATCH --partition=kempner_dev
+#SBATCH --account=kempner_dev
+#SBATCH --time=02:00:00
+#SBATCH --mem=64G
+#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:1
+#SBATCH --output=logs/train_brain_%j.out
+#SBATCH --error=logs/train_brain_%j.err
+
+# Phase 6 Step 1b: Extract latent vectors and train the surrogate Brain
+#
+# Env-var overrides:
+#   AL_SCRIPT_DIR     absolute path to alchemi-clip/
+#   AL_SNAPSHOT_DIR   directory of result_*.csv to train on
+#   AL_MODELS_DIR     directory holding encoder + writing surrogate .pkl
+#   AL_SIF            path to alchemi_clip.sif
+#   AL_ENCODER        foundation | gnn | contrastive (default: contrastive)
+#   AL_TARGET         target property column (default: gap_eV)
+#   AL_N_ESTIMATORS   random forest trees (default: 500)
+
+set -euo pipefail
+if [ -n "${AL_SCRIPT_DIR:-}" ]; then
+    SCRIPT_DIR="${AL_SCRIPT_DIR}"
+else
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+SNAPSHOT_DIR="${AL_SNAPSHOT_DIR:-${SCRIPT_DIR}/../alchemi_ht/data/results}"
+MODELS_DIR="${AL_MODELS_DIR:-${SCRIPT_DIR}/models}"
+SIF="${AL_SIF:-${SCRIPT_DIR}/alchemi_clip.sif}"
+ENCODER="${AL_ENCODER:-${ENCODER:-contrastive}}"
+TARGET="${AL_TARGET:-gap_eV}"
+N_ESTIMATORS="${AL_N_ESTIMATORS:-500}"
+OUTPUT="${AL_SURROGATE_OUTPUT:-${MODELS_DIR}/surrogate_${ENCODER}.pkl}"
+
+mkdir -p "${MODELS_DIR}"
+export SINGULARITYENV_PYTHONNOUSERSITE=1
+export SINGULARITY_CACHEDIR=/n/netscratch/kempner_dev/Lab/bdesinghu/.cache/
+
+echo "=== Phase 6 Step 1b: Train Surrogate Brain (${ENCODER}) ==="
+echo "Node: $(hostname), GPU: ${CUDA_VISIBLE_DEVICES:-none}"
+echo "Snapshot dir: ${SNAPSHOT_DIR}"
+echo "Models dir:   ${MODELS_DIR}"
+echo "Output:       ${OUTPUT}"
+
+singularity exec --nv \
+    --bind /n/netscratch/kempner_dev:/data \
+    --bind "${SCRIPT_DIR}:${SCRIPT_DIR}" \
+    --bind "${SNAPSHOT_DIR}:${SNAPSHOT_DIR}" \
+    --bind "${MODELS_DIR}:${MODELS_DIR}" \
+    "${SIF}" \
+    python "${SCRIPT_DIR}/train_surrogate.py" \
+        --encoder "${ENCODER}" \
+        --results-dir "${SNAPSHOT_DIR}" \
+        --target "${TARGET}" \
+        --n-estimators "${N_ESTIMATORS}" \
+        --output "${OUTPUT}"
+
+echo "Step 1b complete (${ENCODER}), exit code: $?"

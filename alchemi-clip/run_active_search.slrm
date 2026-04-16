@@ -1,0 +1,62 @@
+#!/bin/bash
+#SBATCH --job-name=active-search
+#SBATCH --partition=kempner_dev
+#SBATCH --account=kempner_dev
+#SBATCH --time=02:00:00
+#SBATCH --mem=64G
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:1
+#SBATCH --output=logs/active_search_%j.out
+#SBATCH --error=logs/active_search_%j.err
+
+# Phase 6 Step 2: Active Search — embed unexplored molecules, predict, rank
+#
+# Env-var overrides:
+#   AL_SCRIPT_DIR       absolute path to alchemi-clip/
+#   AL_MODELS_DIR       dir containing surrogate .pkl + encoder .pt
+#   AL_SIF              path to alchemi_clip.sif
+#   AL_ENCODER          foundation | gnn | contrastive
+#   AL_UNEXPLORED_CSV   master SMILES CSV to search
+#   AL_OUTPUT_CSV       where to write active_learning_batch.csv
+#   AL_TOP_K            number of candidates
+
+set -euo pipefail
+if [ -n "${AL_SCRIPT_DIR:-}" ]; then
+    SCRIPT_DIR="${AL_SCRIPT_DIR}"
+else
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+MODELS_DIR="${AL_MODELS_DIR:-${SCRIPT_DIR}/models}"
+SIF="${AL_SIF:-${SCRIPT_DIR}/alchemi_clip.sif}"
+ENCODER="${AL_ENCODER:-${ENCODER:-contrastive}}"
+UNEXPLORED_CSV="${AL_UNEXPLORED_CSV:-${UNEXPLORED_CSV:-${SCRIPT_DIR}/../alchemi_ht/gdb17_subset.csv}}"
+TOP_K="${AL_TOP_K:-${TOP_K:-5000}}"
+OUTPUT_CSV="${AL_OUTPUT_CSV:-${SCRIPT_DIR}/data/chunks/active_learning_batch.csv}"
+SURROGATE_PATH="${AL_SURROGATE_PATH:-${MODELS_DIR}/surrogate_${ENCODER}.pkl}"
+
+mkdir -p "$(dirname "${OUTPUT_CSV}")"
+export SINGULARITYENV_PYTHONNOUSERSITE=1
+export SINGULARITY_CACHEDIR=/n/netscratch/kempner_dev/Lab/bdesinghu/.cache/
+
+echo "=== Phase 6 Step 2: Active Search (${ENCODER}) ==="
+echo "Node: $(hostname), GPU: ${CUDA_VISIBLE_DEVICES:-none}"
+echo "Unexplored CSV: ${UNEXPLORED_CSV}"
+echo "Surrogate:      ${SURROGATE_PATH}"
+echo "Output CSV:     ${OUTPUT_CSV}"
+
+OUT_DIR="$(dirname "${OUTPUT_CSV}")"
+singularity exec --nv \
+    --bind /n/netscratch/kempner_dev:/data \
+    --bind "${SCRIPT_DIR}:${SCRIPT_DIR}" \
+    --bind "${MODELS_DIR}:${MODELS_DIR}" \
+    --bind "${OUT_DIR}:${OUT_DIR}" \
+    "${SIF}" \
+    python "${SCRIPT_DIR}/active_search_latent.py" \
+        --encoder "${ENCODER}" \
+        --unexplored-csv "${UNEXPLORED_CSV}" \
+        --surrogate-path "${SURROGATE_PATH}" \
+        --top-k "${TOP_K}" \
+        --output "${OUTPUT_CSV}"
+
+echo "Step 2 complete (${ENCODER}), exit code: $?"
+echo "Output: ${OUTPUT_CSV}"

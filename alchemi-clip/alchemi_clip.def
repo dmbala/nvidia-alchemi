@@ -1,0 +1,31 @@
+Bootstrap: localimage
+From: /n/netscratch/kempner_dev/Lab/bdesinghu/Agent/alchemi/alchemi_ht/alchemi_ht.sif
+
+%post
+    # The base image (alchemi_ht.sif) already has:
+    #   PyTorch, CUDA, ALCHEMI, AIMNet2, RDKit, pandas, ASE,
+    #   scikit-learn, joblib, numpy (<2)
+    #
+    # Only install the packages that are genuinely missing.
+
+    # HuggingFace Transformers for ChemBERTa / MoLFormer foundation models
+    pip install transformers tokenizers
+
+    # XGBoost (optional — RandomForest from sklearn works, but XGBoost
+    # gives a stronger surrogate Brain when ground-truth data is plentiful)
+    pip install xgboost
+
+    # GNN encoder is implemented in pure PyTorch (SchNet-style),
+    # so torch-geometric is NOT required.
+
+%environment
+    export LC_ALL=C
+    export CUDA_CACHE_DISABLE=0
+    export PYTHONNOUSERSITE=1
+    export WARP_CACHE_PATH=/tmp/warp_cache
+
+%help
+    Container for ALCHEMI Phase 6: Latent-Space Active Learning.
+    Extends alchemi_ht.sif with:
+      - HuggingFace Transformers (ChemBERTa encoder)
+      - XGBoost (optional surrogate Brain upgrade)

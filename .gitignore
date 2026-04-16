@@ -1,0 +1,50 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+uv.lock
+.cache
+worktrees/
+results/
+queue/
+
+# Agent prompt files (generated per-session by launchers)
+CLAUDE.md
+AGENTS.md
+instruction*.md
+
+# Experimental code/artifacts
+dev/
+
+# Results file
+results.tsv
+
+# Training and SLURM logs
+run.log
+logs/
+
+# Singularity images
+*.sif
+
+# Large source datasets (GDB-17 SMILES files, ~50-314 MB each)
+GDB17.*.smi.gz
+
+# Derived master dataset (8.3M rows)
+alchemi_ht/gdb17_subset.csv
+
+# Chunk files (regeneratable from gdb17_subset.csv)
+alchemi_ht/data/chunks/
+runs/screen/chunks/
+
+# Orchestrator runtime state
+runs/
+!runs/.gitkeep
+
+# Build logs (now under container/)
+container/build_interactive.log

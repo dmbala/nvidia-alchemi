@@ -1,0 +1,38 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:25.06-py3
+
+%post
+    # Update and install basic tools
+    apt-get update && apt-get install -y git
+
+    # Install 'uv' for fast dependency management
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+
+    # Install ALCHEMI ops (without [torch] extra since torch is pre-installed in NGC image)
+    pip install nvalchemi-toolkit-ops
+
+    # Install ALCHEMI toolkit from source (not yet on PyPI)
+    # Use --no-deps to avoid torch version conflict with NGC's custom build
+    pip install git+https://github.com/NVIDIA/nvalchemi-toolkit.git --no-deps
+
+    # Install remaining toolkit dependencies with correct version pins
+    pip install loguru jaxtyping tensordict "pydantic>=2.11.7" dm-tree plum-dispatch "zarr>=3" periodictable==2.0.2 rich
+
+    # Restore numpy <2 compatibility (NGC torch is compiled against NumPy 1.x)
+    pip install 'numpy<2'
+
+%environment
+    export LC_ALL=C
+    export CUDA_CACHE_DISABLE=0
+    # Prevent user site-packages from overriding container packages
+    export PYTHONNOUSERSITE=1
+    # Enable NVIDIA Warp to find the JIT compiler inside the container
+    export WARP_CACHE_PATH=/tmp/warp_cache
+
+%runscript
+    exec python "$@"
+
+%help
+    Container for NVIDIA ALCHEMI Toolkit.
+    Supports GPU-accelerated molecular dynamics and MLIP workflows.
