@@ -118,6 +118,32 @@ Cost: ≈100k–200k tokens per day at 15-min intervals. Trivial for short runs,
 
 See [`.claude/commands/ht-loop.md`](../.claude/commands/ht-loop.md). Uses the `loop` skill or `CronCreate` to re-fire ticks within an active REPL session. Default cadence: 10 min running / 1 hour idle. Best when you're actively working in Claude Code and want tick summaries inline.
 
+You can invoke it non-interactively by passing the slash command as the prompt:
+                                               
+  claude -p "/ht-loop"              
+                                                                                              
+  Add any extra instructions after the command name, e.g.:                                    
+                                                                                              
+  # one status tick in v1 (screen-only)                                                       
+  claude -p "/ht-loop run a single status tick in screen mode"                                
+                                                                                              
+  # start a research-mode tick                                                                
+  claude -p "/ht-loop mode=research, action=tick"                                             
+                                                                                              
+  # bootstrap fresh                                                                           
+  claude -p "/ht-loop bootstrap from scratch with shuffle-seed 42"
+                                                                                              
+  Notes:                                                                                      
+  - -p runs headless (prints the final response and exits). If you want it recurring, wrap
+  with the loop skill inside: claude -p "/loop 10m /ht-loop" — but /loop needs an interactive 
+  session to schedule wakeups, so for true cron-style scheduling use /schedule or an external
+  cron calling claude -p "/ht-loop".                                                          
+  - Add --output-format stream-json if you want to parse tool calls/results programmatically.
+  - Add --permission-mode acceptEdits (or bypassPermissions with care) so the SLURM / python 
+  commands inside the skill don't blo
+
+
+
 **Which driver?**
 
 | | `bash` | `agent` | `/ht-loop` |
